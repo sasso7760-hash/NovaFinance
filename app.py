@@ -5,6 +5,7 @@ Datos: sin clave usa Yahoo Finance (yfinance, ~4-5 años anuales).
        Con la variable FMP_API_KEY usa Financial Modeling Prep (10+ años según plan).
 """
 import os
+from datetime import datetime
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -279,6 +280,18 @@ def prev_year_close(symbol: str):
         return None
 
 
+@st.cache_data(ttl=600, show_spinner=False)
+def close_before(symbol: str, day: str):
+    """Último cierre diario anterior a `day` (referencia del cambio en 5 d y 1 m)."""
+    try:
+        h = yf.Ticker(symbol).history(period="3mo", interval="1d")["Close"].dropna()
+        h.index = h.index.tz_localize(None).normalize()
+        h = h[h.index < pd.Timestamp(day)]
+        return float(h.iloc[-1]) if len(h) else None
+    except Exception:
+        return None
+
+
 def _n(v):
     return f"{v:,.2f}" if isinstance(v, (int, float)) else "N/D"
 
@@ -325,7 +338,12 @@ def _fecha(d, nuevo_mes=False):
 
 
 def _epoch(e, tz):
-    return pd.Timestamp(e, unit="s", tz="UTC").tz_convert(tz) if e else None
+    """Segundos epoch o datetime (con o sin zona) -> Timestamp en la zona `tz`."""
+    if e is None or (not isinstance(e, datetime) and not e):
+        return None
+    t = pd.Timestamp(e) if isinstance(e, datetime) else pd.Timestamp(float(e), unit="s", tz="UTC")
+    t = t.tz_localize("UTC") if t.tzinfo is None else t
+    return t.tz_convert(tz)
 
 
 def _intraday_axis(idx, rng, xaxis, tp, tz):
@@ -425,9 +443,11 @@ def render_price(symbol: str, rng: str):
         ref = prev
     elif rng == "YTD" and py:
         ref = py
+    elif rng in ("5D", "1M"):
+        ref = close_before(symbol, str(df.index[0].tz_localize(None).date())) or float(df["Close"].iloc[0])
     else:
         ref = float(df["Close"].iloc[0])
-    pchg = last_bar - ref
+    pchg = reg - ref  # precio regular (igual que el encabezado), no el post-mercado
     up = pchg >= 0
     color, bg = (GREEN, GREEN_BG) if up else (RED, RED_BG)
     name = {v: k for k, v in PRICE_LABELS.items()}[rng]
@@ -467,7 +487,10 @@ def render_price(symbol: str, rng: str):
                   annotation_position="right", annotation_bgcolor=color, annotation_font_color="white")
     xaxis = dict(showgrid=False)
     if intraday:
-        shapes = _intraday_axis(df.index, rng, xaxis, trading_periods(symbol) if rng != "1M" else None, tz)
+        try:
+            shapes = _intraday_axis(df.index, rng, xaxis, trading_periods(symbol) if rng != "1M" else None, tz)
+        except Exception:
+            xaxis, shapes = dict(showgrid=False), []
         for sh in shapes:
             fig.add_shape(**sh)
     pad = (hi - lo) * 0.08 or hi * 0.01
@@ -519,7 +542,12 @@ with tab_price:
     p1, p2 = st.columns([4, 2])
     plabel = p1.segmented_control("Rango del precio", list(PRICE_LABELS), default="1 d", label_visibility="collapsed") or "1 d"
     live = p2.toggle("Actualizar cada 30 s", value=True)
-    st.fragment(run_every=30 if live else None)(render_price)(symbol, PRICE_LABELS[plabel])
+    def safe_price(sym_, rng_):
+        try:
+            render_price(sym_, rng_)
+        except Exception as e:
+            st.error(f"No se pudo mostrar el precio de {sym_}: {type(e).__name__}: {e}")
+    st.fragment(run_every=30 if live else None)(safe_price)(symbol, PRICE_LABELS[plabel])
 
 # ---------- Datos financieros ----------
 try:
