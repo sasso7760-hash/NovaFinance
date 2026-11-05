@@ -200,23 +200,31 @@ def style(fig, **yaxis):
 GREEN, GREEN_BG, RED_BG = "#0f9d58", "rgba(15,157,88,0.15)", "rgba(229,72,77,0.15)"
 CURRENCY_SYMBOLS = {"USD": "$", "EUR": "€", "GBP": "£", "JPY": "¥", "CNY": "¥", "TWD": "NT$", "CAD": "C$",
                     "MXN": "MX$", "CRC": "₡", "KRW": "₩", "INR": "₹", "BRL": "R$", "CHF": "CHF "}
-# rango: (period, interval) de Yahoo
+PRICE_LABELS = {"1 d": "1D", "5 d": "5D", "1 m": "1M", "6 m": "6M", "AIF": "YTD", "1 a": "1Y", "5 a": "5Y", "Todos": "Max"}
 PRICE_RANGES = {"1D": ("1d", "1m"), "5D": ("5d", "5m"), "1M": ("1mo", "30m"), "6M": ("6mo", "1d"),
                 "YTD": ("ytd", "1d"), "1Y": ("1y", "1d"), "5Y": ("5y", "1wk"), "Max": ("max", "1mo")}
+STATE_TEXT = {"REGULAR": "Mercado abierto", "PRE": "Pre-mercado", "PREPRE": "Pre-mercado",
+              "POST": "Post-mercado", "POSTPOST": "Post-mercado", "CLOSED": "Mercado cerrado"}
+INFO_KEYS = ("financialCurrency", "currency", "beta", "shortName", "longName", "quoteType", "fullExchangeName",
+             "marketState", "bid", "ask", "bidSize", "askSize", "open", "regularMarketOpen", "previousClose",
+             "regularMarketPreviousClose", "dayLow", "dayHigh", "fiftyTwoWeekLow", "fiftyTwoWeekHigh", "volume",
+             "averageVolume", "marketCap", "trailingPE", "trailingEps", "dividendRate", "targetMeanPrice",
+             "totalAssets", "navPrice", "regularMarketPrice", "regularMarketTime", "postMarketPrice",
+             "postMarketTime", "preMarketPrice", "preMarketTime")
 
 
 def cur_symbol(cur):
     return CURRENCY_SYMBOLS.get(cur, f"{cur} " if cur else "")
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
+@st.cache_data(ttl=30, show_spinner=False)
 def info(symbol: str) -> dict:
-    """Datos casi estáticos de Yahoo: moneda de reporte, moneda del precio, beta, nombre."""
+    """Ficha de Yahoo (moneda, beta, bid/ask, volumen, capitalización, etc.)."""
     try:
         i = yf.Ticker(symbol).get_info()
     except Exception:
         i = {}
-    return {k: i.get(k) for k in ("financialCurrency", "currency", "beta", "shortName")}
+    return {k: i.get(k) for k in INFO_KEYS}
 
 
 @st.cache_data(ttl=15, show_spinner=False)
@@ -232,64 +240,268 @@ def quote(symbol: str) -> dict:
 
 
 @st.cache_data(ttl=15, show_spinner=False)
-def price_history(symbol: str, rng: str) -> pd.Series:
+def price_history(symbol: str, rng: str) -> pd.DataFrame:
     period, interval = PRICE_RANGES[rng]
-    h = yf.Ticker(symbol).history(period=period, interval=interval)
-    return h["Close"].dropna() if not h.empty else pd.Series(dtype=float)
+    h = yf.Ticker(symbol).history(period=period, interval=interval, prepost=rng in ("1D", "5D"))
+    return h.reindex(columns=["Close", "Volume"]).dropna(subset=["Close"])
 
 
-def _num(v):
+@st.cache_data(ttl=300, show_spinner=False)
+def trading_periods(symbol: str):
+    """Horas de pre-mercado, mercado regular y post-mercado de la sesión actual (epoch)."""
+    try:
+        cp = yf.Ticker(symbol).get_history_metadata()["currentTradingPeriod"]
+        return {k: (cp[k]["start"], cp[k]["end"]) for k in ("pre", "regular", "post")}
+    except Exception:
+        return None
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def calc_beta(symbol: str):
+    """Beta mensual a 5 años frente al S&P 500 (como Yahoo), por si Yahoo no la entrega."""
+    try:
+        def monthly(sym):
+            c = yf.Ticker(sym).history(period="5y", interval="1mo")["Close"]
+            c.index = c.index.tz_localize(None).to_period("M")
+            return c.pct_change()
+        r = pd.concat([monthly(symbol), monthly("^GSPC")], axis=1, keys=["a", "b"]).dropna()
+        return float(r["a"].cov(r["b"]) / r["b"].var()) if len(r) >= 24 else None
+    except Exception:
+        return None
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def prev_year_close(symbol: str):
+    try:
+        h = yf.Ticker(symbol).history(period="2y", interval="1d")["Close"].dropna()
+        return float(h[h.index.year < h.index[-1].year].iloc[-1])
+    except Exception:
+        return None
+
+
+def _n(v):
     return f"{v:,.2f}" if isinstance(v, (int, float)) else "N/D"
+
+
+def _big(v):
+    if not isinstance(v, (int, float)):
+        return "N/D"
+    for div, suf in ((1e12, "T"), (1e9, "B"), (1e6, "MM")):
+        if abs(v) >= div:
+            return f"{v / div:,.2f}{suf}"
+    return f"{v:,.0f}"
+
+
+def _lohi(lo, hi):
+    return f"{_n(lo)} - {_n(hi)}" if lo is not None and hi is not None else "N/D"
+
+
+def stat_grid(columns):
+    """Cuadrícula de datos (etiqueta a la izquierda, valor a la derecha), una lista por columna."""
+    rows = max(len(c) for c in columns)
+    cells = "".join(
+        f'<div class="sg"><span>{c[r][0]}</span><b>{c[r][1]}</b></div>'
+        for r in range(rows) for c in columns if r < len(c))
+    st.markdown(
+        "<style>.sgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:0 32px}"
+        ".sg{display:flex;justify-content:space-between;gap:12px;padding:8px 0;"
+        "border-bottom:1px solid rgba(128,128,128,.25);font-size:.88rem}.sg b{font-weight:600;text-align:right}</style>"
+        f'<div class="sgrid">{cells}</div>', unsafe_allow_html=True)
+
+
+MESES = ["ene", "feb", "mar", "abr", "may", "jun", "jul", "ago", "sep", "oct", "nov", "dic"]
+
+
+def _hora(h, m=0):
+    return f"{(h % 12) or 12}:{m:02d} {'a.m.' if h < 12 else 'p.m.'}"
+
+
+def _tiempo(t):
+    return f"{(t.hour % 12) or 12}:{t:%M:%S} {'a.m.' if t.hour < 12 else 'p.m.'} {t.tzname() or ''}".strip()
+
+
+def _fecha(d, nuevo_mes=False):
+    return f"{MESES[d.month - 1]} '{d:%y}" if nuevo_mes else f"{d.day}/{d.month}"
+
+
+def _epoch(e, tz):
+    return pd.Timestamp(e, unit="s", tz="UTC").tz_convert(tz) if e else None
+
+
+def _intraday_axis(idx, rng, xaxis, tp, tz):
+    """Eje X como Yahoo: sin huecos de noche/fin de semana, horas con la fecha debajo, pre/post-mercado sombreados."""
+    days = sorted(set(idx.normalize()))
+    hrs = pd.Series(idx.hour + idx.minute / 60)
+    start_h, end_h = int(hrs.min()), int(-(-hrs.max() // 1))
+    ticks, texts, shapes = [], [], []
+    if rng != "1D":
+        breaks = [dict(bounds=["sat", "mon"])]
+        if end_h - start_h < 23:
+            breaks.append(dict(bounds=[end_h % 24, start_h], pattern="hour"))
+        have = set(days)
+        missing = [d.strftime("%Y-%m-%d") for d in pd.date_range(days[0], days[-1], freq="D")
+                   if d.weekday() < 5 and d not in have]
+        if missing:
+            breaks.append(dict(values=missing))
+        xaxis["rangebreaks"] = breaks
+    if rng == "1D":
+        d = days[-1]
+        if tp and tz is not None:  # el eje cubre pre-mercado y post-mercado completos
+            start_h = min(start_h, _epoch(tp["pre"][0], tz).hour)
+            end_h = max(end_h, _epoch(tp["post"][1], tz).hour)
+        for h in range(start_h, end_h + 1):
+            if h % 2 == 1:
+                ticks.append(d + pd.Timedelta(hours=h)); texts.append(_hora(h))
+    elif rng == "5D":
+        hours = [h for h in (8, 14) if start_h <= h < end_h] or [start_h]
+        for i, d in enumerate(days):
+            for j, h in enumerate(hours):
+                t = _hora(h) + (f"<br>{_fecha(d, i > 0 and d.month != days[i - 1].month)}" if j == 0 else "")
+                ticks.append(d + pd.Timedelta(hours=h)); texts.append(t)
+    else:  # 1M: una fecha cada pocos días
+        step = max(1, len(days) // 8)
+        for i in range(0, len(days), step):
+            d = days[i]
+            ticks.append(d + pd.Timedelta(hours=start_h)); texts.append(_fecha(d, i > 0 and d.month != days[i - 1].month))
+    if ticks:
+        xaxis.update(tickmode="array", tickvals=ticks, ticktext=texts)
+    if tp and rng in ("1D", "5D") and tz is not None:
+        tod = lambda e: _epoch(e, tz).tz_localize(None)
+        off = lambda t: pd.Timedelta(hours=t.hour, minutes=t.minute)
+        pre, post = [(off(tod(tp[k][0])), off(tod(tp[k][1]))) for k in ("pre", "post")]
+        for d in days:
+            for a, b in (pre, post):
+                shapes.append(dict(type="rect", xref="x", yref="paper", x0=d + a, x1=d + b, y0=0, y1=1,
+                                   fillcolor="rgba(128,128,128,.15)", line_width=0, layer="below"))
+        if rng == "1D":
+            xaxis["range"] = [days[-1] + pre[0], days[-1] + post[1]]
+    return shapes
 
 
 def render_price(symbol: str, rng: str):
     try:
-        h, q = price_history(symbol, rng), quote(symbol)
+        df, q = price_history(symbol, rng), quote(symbol)
     except Exception as e:
         st.error(f"No se pudo obtener el precio de {symbol}: {e}")
         return
-    if h.empty:
+    if df.empty:
         st.warning("Sin datos de precio para este ticker y rango.")
         return
     meta = info(symbol)
     sym = cur_symbol(meta.get("currency"))
-    last = q.get("last_price") or float(h.iloc[-1])
-    prev = q.get("previous_close")
-    base = prev if (rng == "1D" and prev) else float(h.iloc[0])  # como Yahoo: 1D se compara con el cierre anterior
-    up = last >= base
+    tz = df.index.tz
+    last_ts, last_bar = df.index[-1], float(df["Close"].iloc[-1])  # último dato (incluye pre/post-mercado)
+    prev = q.get("previous_close") or meta.get("previousClose")
+    reg = meta.get("regularMarketPrice") or q.get("last_price") or last_bar
+    state = meta.get("marketState")
+
+    # ----- Encabezado (como Yahoo): precio regular y, si aplica, post/pre-mercado -----
+    def block(col, price, base, caption):
+        d = price - base if base else None
+        c = (GREEN if d >= 0 else RED) if d is not None else "inherit"
+        txt = f"{d:+,.2f} ({d / base * 100:+.2f}%)" if d is not None else ""
+        col.markdown(
+            f"<div style='display:flex;align-items:baseline;gap:12px;flex-wrap:wrap'>"
+            f"<span style='font-size:2.4rem;font-weight:700'>{price:,.2f}</span>"
+            f"<span style='font-size:1.15rem;font-weight:600;color:{c}'>{txt}</span></div>"
+            f"<div style='opacity:.75;font-size:.85rem'>{caption}</div>", unsafe_allow_html=True)
+
+    st.caption(f"{meta.get('fullExchangeName') or 'Bolsa'} • {meta.get('currency') or ''}")
+    st.markdown(f"### {meta.get('longName') or meta.get('shortName') or symbol} ({symbol})")
+    h1, h2 = st.columns(2)
+    rt = _epoch(meta.get("regularMarketTime"), tz)
+    block(h1, reg, prev, f"A partir del {_tiempo(last_ts)}. Mercado abierto." if state == "REGULAR"
+          else (f"Al cierre: {_tiempo(rt)}" if rt else STATE_TEXT.get(state, "")))
+    if state in ("POST", "POSTPOST", "CLOSED") and meta.get("postMarketPrice"):
+        pt = _epoch(meta.get("postMarketTime"), tz)
+        block(h2, meta["postMarketPrice"], reg, f"Poscierre: {_tiempo(pt)}" if pt else "Poscierre")
+    elif state in ("PRE", "PREPRE") and meta.get("preMarketPrice"):
+        pt = _epoch(meta.get("preMarketTime"), tz)
+        block(h2, meta["preMarketPrice"], reg, f"Pre-mercado: {_tiempo(pt)}" if pt else "Pre-mercado")
+
+    # ----- Variación del rango elegido (cambia con 1 d / 5 d / 1 m ...) -----
+    py = prev_year_close(symbol)
+    if rng == "1D" and prev:
+        ref = prev
+    elif rng == "YTD" and py:
+        ref = py
+    else:
+        ref = float(df["Close"].iloc[0])
+    pchg = last_bar - ref
+    up = pchg >= 0
     color, bg = (GREEN, GREEN_BG) if up else (RED, RED_BG)
+    name = {v: k for k, v in PRICE_LABELS.items()}[rng]
+    st.markdown(
+        f"<span style='background:{color};color:white;padding:3px 12px;border-radius:6px;font-weight:700'>"
+        f"{pchg / ref * 100:+.2f}%</span> <span style='opacity:.8'>&nbsp;{pchg:+,.2f} en el rango ({name})</span>",
+        unsafe_allow_html=True)
 
-    m = st.columns(5)
-    delta = f"{last - prev:+,.2f} ({(last / prev - 1) * 100:+.2f}%)" if prev else None
-    m[0].metric(meta.get("shortName") or symbol, f"{sym}{last:,.2f}", delta)
-    m[1].metric("Beta", _num(meta.get("beta")),
-                help="Beta de Yahoo Finance (5 años, mensual, frente al S&P 500). "
-                     "Mayor que 1: se mueve más que el mercado. Menor que 1: se mueve menos.")
-    m[2].metric("Cierre anterior", f"{sym}{prev:,.2f}" if prev else "N/D")
-    m[3].metric("Rango del día", f"{_num(q.get('day_low'))} – {_num(q.get('day_high'))}")
-    m[4].metric("Rango 52 semanas", f"{_num(q.get('year_low'))} – {_num(q.get('year_high'))}")
-
-    last_ts = h.index[-1]
-    if rng in ("1D", "5D", "1M"):  # cortar la línea en las pausas (noche / fin de semana)
-        gaps = h.index.to_series().diff() > pd.Timedelta(hours=3)
-        br = h.index[gaps.values] - pd.Timedelta(seconds=1)
+    # ----- Gráfico -----
+    df = df.copy()
+    df.index = df.index.tz_localize(None)  # hora local de la bolsa, sin zona horaria
+    intraday = rng in ("1D", "5D", "1M")
+    if rng == "1D":  # cortar la línea si hay pausas largas (pre-mercado poco líquido)
+        gaps = df.index.to_series().diff() > pd.Timedelta(hours=3)
+        br = df.index[gaps.values] - pd.Timedelta(seconds=1)
         if len(br):
-            h = pd.concat([h, pd.Series(float("nan"), index=br)]).sort_index()
-    lo, hi = float(h.min()), float(h.max())
-    if rng == "1D" and prev:
-        lo, hi = min(lo, prev), max(hi, prev)
+            df = pd.concat([df, pd.DataFrame(float("nan"), index=br, columns=df.columns)]).sort_index()
+    c = df["Close"]
+    fig = go.Figure()
+    fig.add_scatter(x=df.index, y=c, mode="lines", line=dict(width=0), fill="tozeroy", fillcolor=bg,
+                    connectgaps=False, hoverinfo="skip")
+    fmt_x = "%d/%m %I:%M %p" if intraday else "%d %b %Y"
+    hover = f"%{{x|{fmt_x}}}<br>{sym}%{{y:,.2f}}<extra></extra>"
+    near = lambda m: m | m.shift(1, fill_value=False) | m.shift(-1, fill_value=False)
+    for mask, col in ((near(c >= ref), GREEN), (near(c < ref), RED)):  # verde sobre la referencia, rojo debajo
+        fig.add_scatter(x=df.index, y=c.where(mask), mode="lines", line=dict(color=col, width=2),
+                        connectgaps=False, hovertemplate=hover)
+    fig.add_scatter(x=[df.index[-1]], y=[last_bar], mode="markers", marker=dict(color=color, size=8), hoverinfo="skip")
+    vmax = df["Volume"].max()
+    if pd.notna(vmax) and vmax > 0:  # volumen abajo
+        fig.add_bar(x=df.index, y=df["Volume"], yaxis="y2", marker_color="rgba(128,128,128,.5)", hoverinfo="skip")
+        fig.update_layout(yaxis2=dict(overlaying="y", range=[0, vmax * 4], visible=False))
+    lo, hi = min(float(c.min()), ref), max(float(c.max()), ref)
+    fig.add_hline(y=ref, line_dash="dash", line_color="rgba(200,200,200,.8)", annotation_text=f"{ref:,.2f}",
+                  annotation_position="right", annotation_bgcolor="white", annotation_font_color="black")
+    fig.add_hline(y=last_bar, line_dash="dot", line_color=color, annotation_text=f"{last_bar:,.2f}",
+                  annotation_position="right", annotation_bgcolor=color, annotation_font_color="white")
+    xaxis = dict(showgrid=False)
+    if intraday:
+        shapes = _intraday_axis(df.index, rng, xaxis, trading_periods(symbol) if rng != "1M" else None, tz)
+        for sh in shapes:
+            fig.add_shape(**sh)
     pad = (hi - lo) * 0.08 or hi * 0.01
-    fig = go.Figure(go.Scatter(
-        x=h.index, y=h.values, mode="lines", line=dict(color=color, width=2), fill="tozeroy",
-        fillcolor=bg, connectgaps=False, hovertemplate=f"%{{x}}<br>{sym}%{{y:,.2f}}<extra></extra>"))
-    if rng == "1D" and prev:
-        fig.add_hline(y=prev, line_dash="dot", line_color="gray")
-    fig.update_layout(height=420, margin=dict(l=10, r=10, t=10, b=10), showlegend=False,
-                      yaxis=dict(range=[lo - pad, hi + pad], side="right", gridcolor="rgba(128,128,128,.25)"),
-                      plot_bgcolor="rgba(0,0,0,0)")
+    fig.update_layout(height=460, margin=dict(l=10, r=70, t=10, b=10), showlegend=False, xaxis=xaxis,
+                      yaxis=dict(range=[lo - pad, hi + pad], side="right", gridcolor="rgba(128,128,128,.25)",
+                                 tickformat=",.2f"), plot_bgcolor="rgba(0,0,0,0)")
     st.plotly_chart(fig, width="stretch")
-    st.caption(f"Último dato: {last_ts:%d/%m/%Y %H:%M} ({last_ts.tzname()}). Fuente: Yahoo Finance; puede tener "
-               "hasta 15 minutos de retraso según la bolsa. El rango de arriba (1Y, 3Y…) no aplica a esta pestaña.")
+
+    # ----- Datos (como Yahoo) -----
+    beta = meta.get("beta")
+    beta = beta if isinstance(beta, (int, float)) else calc_beta(symbol)
+    ytd = f"{(reg / py - 1) * 100:+.2f}%" if py else "N/D"
+    bid, ask = meta.get("bid"), meta.get("ask")
+    size = lambda k: f" x {meta[k]}" if meta.get(k) else ""
+    col1 = [("Precio de cierre del día anterior", _n(prev)),
+            ("Apertura", _n(meta.get("open") or meta.get("regularMarketOpen"))),
+            ("Oferta", f"{_n(ask)}{size('askSize')}" if ask else "N/D"),
+            ("Demanda", f"{_n(bid)}{size('bidSize')}" if bid else "N/D")]
+    col2 = [("Rango diario", _lohi(q.get("day_low"), q.get("day_high"))),
+            ("Rango de 52 semanas", _lohi(q.get("year_low"), q.get("year_high"))),
+            ("Volumen", f"{meta['volume']:,.0f}" if meta.get("volume") else "N/D"),
+            ("Volumen prom.", f"{meta['averageVolume']:,.0f}" if meta.get("averageVolume") else "N/D")]
+    if meta.get("quoteType") == "ETF":
+        col3 = [("Activos netos", _big(meta.get("totalAssets"))), ("Valor de activo neto", _n(meta.get("navPrice"))),
+                ("Relación precio/utilidad", _n(meta.get("trailingPE")))]
+    else:
+        col3 = [("Cap. de mercado", _big(meta.get("marketCap"))), ("Relación precio/utilidad (TTM)", _n(meta.get("trailingPE"))),
+                ("BPA (TTM)", _n(meta.get("trailingEps"))), ("Dividendo anual", _n(meta.get("dividendRate")))]
+    col4 = [("Beta (mensual por 5 años)", _n(beta)), ("Variación en el año (precio)", ytd)]
+    if meta.get("quoteType") != "ETF":
+        col4.append(("Precio objetivo a 1 año", _n(meta.get("targetMeanPrice"))))
+    stat_grid([col1, col2, col3, col4])
+    st.caption("Fuente: Yahoo Finance; puede tener hasta 15 minutos de retraso según la bolsa. "
+               "El rango de arriba (1Y, 3Y…) no aplica a esta pestaña.")
 
 
 # ---------- Controles ----------
@@ -305,9 +517,9 @@ tab_rent, tab_eps, tab_fcf, tab_price = st.tabs(
 # ---------- Precio en vivo (independiente de los datos financieros) ----------
 with tab_price:
     p1, p2 = st.columns([4, 2])
-    prng = p1.segmented_control("Rango del precio", list(PRICE_RANGES), default="1D", label_visibility="collapsed") or "1D"
+    plabel = p1.segmented_control("Rango del precio", list(PRICE_LABELS), default="1 d", label_visibility="collapsed") or "1 d"
     live = p2.toggle("Actualizar cada 30 s", value=True)
-    st.fragment(run_every=30 if live else None)(render_price)(symbol, prng)
+    st.fragment(run_every=30 if live else None)(render_price)(symbol, PRICE_LABELS[plabel])
 
 # ---------- Datos financieros ----------
 try:
