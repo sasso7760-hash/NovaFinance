@@ -4,9 +4,11 @@ Uso:  pip install -r requirements.txt  &&  streamlit run app.py
 Datos: sin clave usa Yahoo Finance (yfinance, ~4-5 años anuales).
        Con la variable FMP_API_KEY usa Financial Modeling Prep (10+ años según plan).
 """
+import html
 import os
 from datetime import datetime
 
+import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import requests
@@ -17,11 +19,10 @@ st.set_page_config(page_title="Métricas financieras", layout="wide")
 
 METRICS = {
     "Return on Capital Employed": "roce",
-    "Gross Margin": "gross",
     "Operating Margin": "operating",
-    "Profit Margin": "profit",
+    "Net Margin": "profit",
 }
-COLORS = {"roce": "#4f83e8", "gross": "#1f9d6b", "operating": "#f59e0b", "profit": "#8b5cf6"}
+COLORS = {"roce": "#4f83e8", "operating": "#f59e0b", "profit": "#1f9d6b"}
 RANGES = {"1Y": 1, "3Y": 3, "5Y": 5, "10Y": 10, "Max": None}
 FMP_KEY = os.getenv("FMP_API_KEY", "")
 BLUE, LIGHT_BLUE, RED = "#4f83e8", "#a9c1f5", "#e5484d"
@@ -55,8 +56,8 @@ SEC_TAGS = {
 
 
 def _sec_series(gaap, tags, instant, unit):
-    """Serie anual (fin de ejercicio -> valor) de los 10-K; usa el dato mas reciente y varios tags."""
-    out = {}
+    """Serie anual (fin de ejercicio -> valor) de los 10-K, con la fecha de presentación del dato usado."""
+    out, filed = {}, {}
     for tag in tags:
         best = {}
         for e in gaap.get(tag, {}).get("units", {}).get(unit, []):
@@ -66,9 +67,10 @@ def _sec_series(gaap, tags, instant, unit):
                 continue
             if e["end"] not in best or e["filed"] > best[e["end"]][0]:
                 best[e["end"]] = (e["filed"], e["val"])
-        for k, (_, v) in best.items():
-            out.setdefault(k, v)
-    return pd.Series(out, dtype=float)
+        for k, (f, v) in best.items():
+            if k not in out:
+                out[k], filed[k] = v, f
+    return pd.Series(out, dtype=float), pd.Series(filed, dtype=object)
 
 
 @st.cache_data(ttl=86400, show_spinner=False)
@@ -87,11 +89,21 @@ def _sec_annual(symbol: str) -> pd.DataFrame:
                      headers={"User-Agent": SEC_UA}, timeout=60)
     r.raise_for_status()
     gaap = r.json().get("facts", {}).get("us-gaap", {})
-    df = pd.DataFrame({k: _sec_series(gaap, *v) for k, v in SEC_TAGS.items()})
+    res = {k: _sec_series(gaap, *v) for k, v in SEC_TAGS.items()}
+    df = pd.DataFrame({k: r[0] for k, r in res.items()})
     if df["revenue"].dropna().empty:  # p. ej. empresas extranjeras (20-F/IFRS): sin datos us-gaap
         raise ValueError("la SEC no tiene estados financieros us-gaap para este ticker")
     df["gross"] = df["gross"].fillna(df["revenue"] - df["cogs"])
     df["fcf"] = df["ocf"] - df["capex"]
+    try:  # el EPS de un 10-K antiguo no refleja splits posteriores: se ajusta para compararlo con el precio actual
+        sp = yf.Ticker(symbol).splits
+        sp.index = sp.index.tz_localize(None)
+        for end, f in res["eps"][1].items():
+            fac = float(sp[sp.index > pd.Timestamp(f)].prod())
+            if fac not in (1.0, 0.0) and end in df.index:
+                df.loc[end, "eps"] = df.loc[end, "eps"] / fac
+    except Exception:
+        pass
     df.index = pd.to_datetime(df.index)
     cols = ["revenue", "gross", "ebit", "net", "assets", "curliab", "eps", "fcf"]
     return df[cols].rename_axis("date").reset_index()
@@ -211,7 +223,7 @@ INFO_KEYS = ("financialCurrency", "currency", "beta", "shortName", "longName", "
              "regularMarketPreviousClose", "dayLow", "dayHigh", "fiftyTwoWeekLow", "fiftyTwoWeekHigh", "volume",
              "averageVolume", "marketCap", "trailingPE", "trailingEps", "dividendRate", "targetMeanPrice",
              "totalAssets", "navPrice", "regularMarketPrice", "regularMarketTime", "postMarketPrice",
-             "postMarketTime", "preMarketPrice", "preMarketTime")
+             "postMarketTime", "preMarketPrice", "preMarketTime", "forwardPE", "trailingPegRatio", "pegRatio")
 
 
 def cur_symbol(cur):
@@ -309,11 +321,58 @@ def _lohi(lo, hi):
     return f"{_n(lo)} - {_n(hi)}" if lo is not None and hi is not None else "N/D"
 
 
+TIPS = {
+    "Return on Capital Employed": "ROCE: utilidad operativa ÷ (activos totales − pasivo corriente). Cuánto gana la empresa por cada dólar de capital que usa en su negocio.",
+    "Operating Margin": "Margen operativo: utilidad operativa ÷ ingresos. Qué parte de cada dólar vendido queda después de los costos de operar, antes de intereses e impuestos.",
+    "Net Margin": "Margen neto: utilidad neta ÷ ingresos. Qué parte de cada dólar vendido queda como ganancia final, después de todos los costos, intereses e impuestos.",
+    "Promedio": "Promedio de la primera métrica elegida en los últimos N años. Aparece N/A si no hay datos suficientes para ese plazo.",
+    "EPS diluido": "Ganancia por acción diluida: utilidad neta ÷ acciones en circulación, contando también opciones y bonos convertibles.",
+    "EPS estimado": "Promedio de lo que esperan los analistas que gane la empresa por acción en los próximos periodos (consenso de Yahoo Finance).",
+    "Proyección": "Escenario simple: EPS del último año × (1 + crecimiento anual)^años. Es un ejercicio con el supuesto que elijas, no una predicción.",
+    "P/E": "Precio ÷ ganancia por acción. Cuántos dólares pagan los inversionistas por cada dólar de ganancia anual. Alto: se espera crecimiento (o está cara). Bajo: barata o con problemas. Se compara mejor con empresas del mismo sector.",
+    "P/E adelante": "Precio actual ÷ EPS estimado para el próximo año. Un P/E menor al actual sugiere que se espera que las ganancias crezcan.",
+    "Crecimiento EPS (CAGR)": "Tasa de crecimiento anual compuesta del EPS en los últimos años (hasta 5). Solo se calcula si el EPS inicial y el final son positivos.",
+    "FCF": "Flujo de caja libre: efectivo que generan las operaciones − inversiones en activos fijos (capex). Es el dinero que queda para dividendos, recompras, deuda o crecimiento.",
+    "PEG": "PEG = P/E ÷ crecimiento anual del EPS (%). Ajusta el P/E por el crecimiento: cerca de 1 suele verse como valoración razonable, menos de 1 como barata respecto a su crecimiento y más de 2 como cara. Es una guía, no una recomendación.",
+    "Precio de cierre del día anterior": "Último precio al cierre de la sesión anterior. Es la base del cambio diario.",
+    "Apertura": "Precio de la primera operación de la sesión de hoy.",
+    "Oferta": "Precio más bajo al que hay vendedores dispuestos a vender ahora (ask), y la cantidad ofrecida.",
+    "Demanda": "Precio más alto que ofrecen los compradores ahora (bid), y la cantidad demandada.",
+    "Rango diario": "Precio más bajo y más alto de la sesión de hoy.",
+    "Rango de 52 semanas": "Precio más bajo y más alto del último año.",
+    "Volumen": "Número de acciones negociadas en la sesión de hoy.",
+    "Volumen prom.": "Promedio reciente de acciones negociadas por día. Sirve para saber si el volumen de hoy es normal o inusual.",
+    "Cap. de mercado": "Precio × acciones en circulación: el valor total de la empresa en bolsa.",
+    "Relación precio/utilidad (TTM)": "P/E con la ganancia de los últimos 12 meses (TTM). Cuántos dólares se pagan por cada dólar de ganancia anual.",
+    "Relación precio/utilidad": "P/E: precio ÷ ganancia por acción. Cuántos dólares se pagan por cada dólar de ganancia anual.",
+    "BPA (TTM)": "Beneficio por acción de los últimos 12 meses (TTM).",
+    "Dividendo anual": "Dividendo por acción que la empresa paga en un año.",
+    "Beta (mensual por 5 años)": "Sensibilidad frente al S&P 500 con 5 años de datos mensuales. 1: se mueve igual que el mercado. Mayor que 1: más volátil. Menor que 1: menos volátil.",
+    "Variación en el año (precio)": "Cambio del precio desde el último cierre del año pasado, sin contar dividendos.",
+    "Precio objetivo a 1 año": "Promedio de los precios objetivo que dan los analistas a 12 meses.",
+    "Activos netos": "Patrimonio total que administra el ETF.",
+    "Valor de activo neto": "NAV: valor por participación de los activos que tiene el ETF.",
+}
+CSS = ("<style>.tip{cursor:help;border-bottom:1px dotted rgba(128,128,128,.9)}"
+       ".chips{display:flex;flex-wrap:wrap;gap:8px 18px;font-size:.85rem;margin:4px 0 10px}</style>")
+
+
+def tip(label):
+    t = TIPS.get(label)
+    return f'<span class="tip" title="{html.escape(t, quote=True)}">{label}</span>' if t else label
+
+
+def glosario(*keys):
+    """Fila de nombres de métricas; al pasar el cursor se ve qué significan."""
+    st.markdown('<div class="chips">' + "".join(f"<span>{tip(k)} ⓘ</span>" for k in keys) + "</div>",
+                unsafe_allow_html=True)
+
+
 def stat_grid(columns):
     """Cuadrícula de datos (etiqueta a la izquierda, valor a la derecha), una lista por columna."""
     rows = max(len(c) for c in columns)
     cells = "".join(
-        f'<div class="sg"><span>{c[r][0]}</span><b>{c[r][1]}</b></div>'
+        f'<div class="sg"><span>{tip(c[r][0])}</span><b>{c[r][1]}</b></div>'
         for r in range(rows) for c in columns if r < len(c))
     st.markdown(
         "<style>.sgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:0 32px}"
@@ -523,25 +582,112 @@ def render_price(symbol: str, rng: str):
     if meta.get("quoteType") != "ETF":
         col4.append(("Precio objetivo a 1 año", _n(meta.get("targetMeanPrice"))))
     stat_grid([col1, col2, col3, col4])
-    st.caption("Fuente: Yahoo Finance; puede tener hasta 15 minutos de retraso según la bolsa. "
-               "El rango de arriba (1Y, 3Y…) no aplica a esta pestaña.")
+    st.caption("Fuente: Yahoo Finance; puede tener hasta 15 minutos de retraso según la bolsa.")
+
+
+# ---------- P/E, PEG y proyección ----------
+ORANGE = "#f59e0b"
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def daily_close(symbol: str) -> pd.DataFrame:
+    """Cierres diarios (ajustados solo por splits) para calcular el P/E histórico."""
+    try:
+        h = yf.Ticker(symbol).history(period="max", interval="1d", auto_adjust=False)["Close"].dropna()
+        return pd.DataFrame({"date": h.index.tz_localize(None).normalize().astype("datetime64[ns]"), "px": h.values})
+    except Exception:
+        return pd.DataFrame({"date": pd.Series(dtype="datetime64[ns]"), "px": pd.Series(dtype=float)})
+
+
+def same_currency(meta: dict) -> bool:
+    """El P/E solo es válido si el precio y las cifras están en la misma moneda (ej. no en ADR de Taiwán)."""
+    a, b = meta.get("currency"), meta.get("financialCurrency")
+    return not (a and b and a != b)
+
+
+def pe_series(symbol: str, data: pd.DataFrame, mode: str) -> pd.Series:
+    """P/E = precio al cierre de cada periodo ÷ EPS (de 12 meses en Quarterly y TTM)."""
+    eps = data["eps"].rolling(4).sum() if mode == "Quarterly" else data["eps"]
+    px = daily_close(symbol)
+    if px.empty:
+        return pd.Series(np.nan, index=data.index)
+    left = pd.DataFrame({"date": pd.to_datetime(data["date"]).astype("datetime64[ns]")})
+    price = pd.merge_asof(left, px, on="date", direction="backward")["px"].values
+    return pd.Series(price / eps.values, index=data.index).where(eps.values > 0)
+
+
+def eps_cagr(d: pd.DataFrame, max_years: int = 5):
+    e = d["eps"].dropna()
+    k = min(max_years, len(e) - 1)
+    if k < 1:
+        return None
+    e0, e1 = float(e.iloc[-1 - k]), float(e.iloc[-1])
+    return ((e1 / e0) ** (1 / k) - 1) * 100 if e0 > 0 and e1 > 0 else None
+
+
+def pe_peg(symbol: str, d: pd.DataFrame) -> pd.DataFrame:
+    """Por año: P/E, crecimiento del EPS (CAGR de hasta 3 años) y PEG = P/E ÷ crecimiento."""
+    d = d.dropna(subset=["eps"]).reset_index(drop=True)
+    out = pd.DataFrame({"label": d["label"], "eps": d["eps"], "pe": pe_series(symbol, d, "Annual")})
+    g = []
+    for i in range(len(d)):
+        k = min(3, i)
+        e0, e1 = (float(d["eps"].iloc[i - k]), float(d["eps"].iloc[i])) if k else (0.0, 0.0)
+        g.append(((e1 / e0) ** (1 / k) - 1) * 100 if k and e0 > 0 and e1 > 0 else np.nan)
+    out["growth"] = g
+    out["peg"] = out["pe"] / out["growth"].where(out["growth"] > 0)
+    return out
+
+
+def annual(sym: str):
+    try:
+        return compute(load(sym, "Annual"), "Annual")
+    except Exception:
+        return None
 
 
 # ---------- Controles ----------
+st.markdown(CSS, unsafe_allow_html=True)
 st.markdown("### Métricas financieras")
-c1, c2, c3 = st.columns([2, 1, 3])
-mode = c1.segmented_control("Periodo", ["Annual", "Quarterly", "TTM"], default="Annual", label_visibility="collapsed") or "Annual"
-symbol = c2.text_input("Ticker", "GOOG", label_visibility="collapsed").strip().upper()
-rng = c3.segmented_control("Rango", list(RANGES), default="10Y", label_visibility="collapsed") or "10Y"
+for k_, d_ in (("mode", "Annual"), ("rng", "10Y"), ("cmp", "")):
+    st.session_state.setdefault(k_, d_)
+tc, _ = st.columns([1, 3])
+symbol = tc.text_input("Ticker", "GOOG", label_visibility="collapsed", max_chars=12).strip().upper()
 
-tab_rent, tab_eps, tab_fcf, tab_price = st.tabs(
-    ["Rentabilidad", "Ganancia por acción", "Flujo de caja libre (FCF)", "Precio en vivo"])
+
+def _sync(k, w):  # copia el valor de un control a la variable compartida
+    st.session_state[k] = st.session_state.get(w) or st.session_state[k]
+
+
+def _sync_cmp(w):
+    st.session_state["cmp"] = (st.session_state.get(w) or "").strip().upper()
+
+
+def fin_controls(tab, mode=True, rng=True, cmp=False):
+    """Controles dentro de cada pestaña financiera (no aparecen en 'Precio en vivo'); se mantienen sincronizados."""
+    cols = st.columns([2, 3, 2])
+    for col, k, opts, on in ((cols[0], "mode", ["Annual", "Quarterly", "TTM"], mode),
+                             (cols[1], "rng", list(RANGES), rng)):
+        if on:
+            w = f"{k}_{tab}"
+            st.session_state[w] = st.session_state[k]
+            col.segmented_control(k, opts, key=w, label_visibility="collapsed", on_change=_sync, args=(k, w))
+    if cmp:
+        w = f"cmp_{tab}"
+        st.session_state[w] = st.session_state["cmp"]
+        cols[2].text_input("Comparar con", key=w, placeholder="Comparar con (ej. MSFT)", label_visibility="collapsed",
+                           on_change=_sync_cmp, args=(w,))
+
+
+tab_rent, tab_eps, tab_fcf, tab_peg, tab_price = st.tabs(
+    ["Rentabilidad", "Ganancia por acción", "Flujo de caja libre (FCF)", "PEG ratio", "Precio en vivo"])
 
 # ---------- Precio en vivo (independiente de los datos financieros) ----------
 with tab_price:
     p1, p2 = st.columns([4, 2])
     plabel = p1.segmented_control("Rango del precio", list(PRICE_LABELS), default="1 d", label_visibility="collapsed") or "1 d"
     live = p2.toggle("Actualizar cada 30 s", value=True)
+
     def safe_price(sym_, rng_):
         try:
             render_price(sym_, rng_)
@@ -550,78 +696,214 @@ with tab_price:
     st.fragment(run_every=30 if live else None)(safe_price)(symbol, PRICE_LABELS[plabel])
 
 # ---------- Datos financieros ----------
-try:
-    data = compute(load(symbol, mode), mode)
-except Exception as e:
-    msg = str(e).replace(FMP_KEY, "***") if FMP_KEY else str(e)  # nunca mostrar la clave en pantalla
-    st.error(f"No se pudieron obtener datos financieros de {symbol}: {msg}")
-    st.stop()
-
+mode, rng = st.session_state["mode"], st.session_state["rng"]
 per_year = 1 if mode == "Annual" else 4
 years = RANGES[rng]
-view = data if years is None else data.tail(years * per_year)
-cur = info(symbol).get("financialCurrency")  # moneda en que la empresa reporta (puede no ser USD)
+try:
+    data = compute(load(symbol, mode), mode)
+    view = data if years is None else data.tail(years * per_year)
+    err = None
+except Exception as e:
+    data = view = None
+    err = f"No se pudieron obtener datos financieros de {symbol}: " + (str(e).replace(FMP_KEY, "***") if FMP_KEY else str(e))
+
+
+def has_data():
+    if data is None:
+        st.error(err)
+    return data is not None
+
+
+meta = info(symbol)
+cur = meta.get("financialCurrency")  # moneda en que la empresa reporta (puede no ser USD)
 csym = cur_symbol(cur)
-cur_note = (f"Cifras en {cur} (moneda de reporte de la empresa)." if cur else "")
+cur_note = f"Cifras en {cur} (moneda de reporte de la empresa)." if cur else ""
 if cur and cur != "USD":
     cur_note += " El EPS estimado puede venir en otra moneda o por ADR: compáralo con cuidado."
 
 # ---------- Rentabilidad ----------
 with tab_rent:
-    picked = st.pills("Series", list(METRICS), selection_mode="multi", default=["Return on Capital Employed"], label_visibility="collapsed")
-    fig = go.Figure()
-    for name in picked:
-        k = METRICS[name]
-        fig.add_bar(x=view["label"], y=view[k], name=name, marker_color=COLORS[k])
-    st.plotly_chart(style(fig, ticksuffix="%"), width="stretch")
-    if picked:  # Promedio de la primera serie en los últimos 1/3/5/10 años (N/A si faltan datos)
-        k = METRICS[picked[0]]
-        for col, n in zip(st.columns(4), [1, 3, 5, 10]):
-            tail = data[k].dropna().tail(n * per_year)
-            col.metric(f"{n}Y (promedio)", f"{tail.mean():.1f}%" if len(tail) >= n * per_year else "N/A")
-
-# ---------- EPS real + estimado ----------
-with tab_eps:
-    if view["eps"].notna().any():
+    fin_controls("rent")
+    if has_data():
+        picked = st.pills("Series", list(METRICS), selection_mode="multi", default=["Return on Capital Employed"], label_visibility="collapsed")
         fig = go.Figure()
-        fig.add_bar(x=view["label"], y=view["eps"], name="EPS diluido", marker_color=BLUE,
-                    texttemplate="%{y:,.2f}", textposition="outside")
-        fwd = load_forward(symbol, mode, data["date"].iloc[-1]) if mode != "TTM" else pd.DataFrame()
-        if not fwd.empty:
-            fig.add_bar(x=fwd["label"], y=fwd["eps"], name="EPS estimado (consenso)",
-                        marker_color=LIGHT_BLUE, marker_pattern_shape="/",
+        for name in picked:
+            k = METRICS[name]
+            fig.add_bar(x=view["label"], y=view[k], name=name, marker_color=COLORS[k])
+        st.plotly_chart(style(fig, ticksuffix="%"), width="stretch")
+        glosario(*METRICS)
+        if picked:  # Promedio de la primera serie en los últimos 1/3/5/10 años (N/A si faltan datos)
+            k = METRICS[picked[0]]
+            for col, n in zip(st.columns(4), [1, 3, 5, 10]):
+                tail = data[k].dropna().tail(n * per_year)
+                col.metric(f"{n}Y (promedio)", f"{tail.mean():.1f}%" if len(tail) >= n * per_year else "N/A", help=TIPS["Promedio"])
+        with st.expander("Ver datos"):
+            fcf_col = f"FCF ({cur})" if cur else "FCF"
+            t = view.drop(columns=["date", "gross"]).set_index("label").rename_axis("Periodo").rename(columns={
+                "eps": "EPS", "fcf": fcf_col, "operating": "Margen operativo (%)",
+                "profit": "Margen neto (%)", "roce": "ROCE (%)"})
+            fmt = {c: "{:,.2f}" for c in t.columns}
+            fmt[fcf_col] = "{:,.0f}"
+            st.dataframe(t.style.format(fmt, na_rep="—"), width="stretch")
+
+# ---------- EPS: actual, estimado, P/E, comparativo y proyección ----------
+with tab_eps:
+    fin_controls("eps", cmp=True)
+    if has_data():
+        cmp_sym = st.session_state["cmp"] if st.session_state["cmp"] != symbol else ""
+        cdata, cmeta, cview = None, {}, None
+        if cmp_sym:
+            try:
+                cdata, cmeta = compute(load(cmp_sym, mode), mode), info(cmp_sym)
+                cview = cdata if years is None else cdata.tail(years * per_year)
+            except Exception as e:
+                st.warning(f"No se pudo cargar {cmp_sym} para comparar: {e}")
+        ad = annual(symbol)
+        cagr = eps_cagr(ad) if ad is not None else None
+        m = st.columns(4)
+        m[0].metric("P/E (TTM)", _n(meta.get("trailingPE")), help=TIPS["P/E"])
+        m[1].metric("P/E adelante", _n(meta.get("forwardPE")), help=TIPS["P/E adelante"])
+        m[2].metric("BPA (TTM)", _n(meta.get("trailingEps")), help=TIPS["BPA (TTM)"])
+        m[3].metric("Crecimiento EPS (CAGR)", f"{cagr:.1f}%" if cagr is not None else "N/D", help=TIPS["Crecimiento EPS (CAGR)"])
+
+        st.markdown("**Ganancia por acción (EPS)**")
+        if view["eps"].notna().any():
+            fig = go.Figure()
+            fig.add_bar(x=view["label"], y=view["eps"], name=f"EPS diluido {symbol}" if cview is not None else "EPS diluido",
+                        marker_color=BLUE, texttemplate="%{y:,.2f}", textposition="outside")
+            if cview is not None:
+                fig.add_bar(x=cview["label"], y=cview["eps"], name=f"EPS diluido {cmp_sym}", marker_color=ORANGE,
+                            texttemplate="%{y:,.2f}", textposition="outside")
+            fwd = load_forward(symbol, mode, data["date"].iloc[-1]) if mode != "TTM" else pd.DataFrame()
+            if not fwd.empty:
+                fig.add_bar(x=fwd["label"], y=fwd["eps"], name="EPS estimado (consenso)",
+                            marker_color=LIGHT_BLUE, marker_pattern_shape="/",
+                            texttemplate="%{y:,.2f}", textposition="outside")
+            st.plotly_chart(style(fig, title_text=f"EPS ({cur})" if cur else None), width="stretch")
+            glosario("EPS diluido", "EPS estimado")
+            if mode == "TTM":
+                st.caption("Las estimaciones futuras se muestran solo en Annual y Quarterly.")
+            elif fwd.empty:
+                st.caption("No se encontraron estimaciones de analistas para este ticker.")
+            if cur_note:
+                st.caption(cur_note)
+        else:
+            st.info("Sin datos de EPS para este ticker.")
+
+        st.markdown("**P/E histórico (precio al cierre de cada periodo ÷ EPS)**")
+        if not same_currency(meta):
+            st.info(f"No se calcula el P/E histórico: el precio está en {meta.get('currency')} y las cifras en {cur}. "
+                    "Arriba se muestra el P/E actual de Yahoo.")
+        else:
+            fig = go.Figure()
+            fig.add_scatter(x=view["label"], y=pe_series(symbol, data, mode).loc[view.index], mode="lines+markers+text",
+                            name=f"P/E {symbol}" if cview is not None else "P/E", line=dict(color=BLUE),
+                            texttemplate="%{y:.1f}", textposition="top center")
+            if cview is not None and same_currency(cmeta):
+                fig.add_scatter(x=cview["label"], y=pe_series(cmp_sym, cdata, mode).loc[cview.index], mode="lines+markers+text",
+                                name=f"P/E {cmp_sym}", line=dict(color=ORANGE), texttemplate="%{y:.1f}", textposition="top center")
+            st.plotly_chart(style(fig, title_text="P/E (veces)"), width="stretch")
+            glosario("P/E", "P/E adelante")
+
+        st.markdown("**Proyección del EPS**")
+        base = ad.dropna(subset=["eps"]).tail(5) if ad is not None else None
+        if base is None or base.empty:
+            st.info("No hay EPS anual suficiente para proyectar.")
+        else:
+            last_eps, last_year = float(base["eps"].iloc[-1]), int(base["date"].iloc[-1].year)
+            g_def = cagr if cagr is not None else 8.0
+            c1, c2 = st.columns(2)
+            g = c1.number_input("Crecimiento anual supuesto (%)", value=float(round(max(-50.0, min(100.0, g_def)), 1)),
+                                step=0.5, help="Por defecto es el crecimiento histórico del EPS (CAGR). Cámbialo para probar otros escenarios.")
+            n = c2.slider("Años a proyectar", 1, 5, 3)
+            fig = go.Figure()
+            fig.add_bar(x=base["label"], y=base["eps"], name="EPS real", marker_color=BLUE,
                         texttemplate="%{y:,.2f}", textposition="outside")
-        st.plotly_chart(style(fig, title_text=f"EPS ({cur})" if cur else None), width="stretch")
-        if mode == "TTM":
-            st.caption("Las estimaciones futuras se muestran solo en Annual y Quarterly.")
-        elif fwd.empty:
-            st.caption("No se encontraron estimaciones de analistas para este ticker.")
-        if cur_note:
-            st.caption(cur_note)
-    else:
-        st.info("Sin datos de EPS para este ticker.")
+            fig.add_bar(x=[str(last_year + i) for i in range(1, n + 1)], y=[last_eps * (1 + g / 100) ** i for i in range(1, n + 1)],
+                        name=f"Proyección ({g:+.1f}% anual)", marker_color=ORANGE, marker_pattern_shape="x",
+                        texttemplate="%{y:,.2f}", textposition="outside")
+            fa = load_forward(symbol, "Annual", ad["date"].iloc[-1])
+            if not fa.empty:
+                fig.add_bar(x=fa["label"].str.replace(" (est.)", "", regex=False), y=fa["eps"], name="Estimado de analistas",
+                            marker_color=LIGHT_BLUE, marker_pattern_shape="/", texttemplate="%{y:,.2f}", textposition="outside")
+            st.plotly_chart(style(fig, title_text=f"EPS ({cur})" if cur else None), width="stretch")
+            glosario("Proyección", "EPS estimado", "Crecimiento EPS (CAGR)")
+            if cagr is None:
+                st.caption("No se pudo calcular el crecimiento histórico (EPS negativo o pocos años): usa un supuesto manual.")
+
+        if cdata is not None:
+            st.markdown(f"**Comparativo: {symbol} vs {cmp_sym}**")
+            cad = annual(cmp_sym)
+            rows = [{"Ticker": s_, "BPA (TTM)": m_.get("trailingEps"), "P/E (TTM)": m_.get("trailingPE"),
+                     "P/E adelante": m_.get("forwardPE"),
+                     "Crecimiento EPS (CAGR, %)": eps_cagr(d_) if d_ is not None else None}
+                    for s_, m_, d_ in ((symbol, meta, ad), (cmp_sym, cmeta, cad))]
+            st.dataframe(pd.DataFrame(rows).set_index("Ticker").astype(float).style.format("{:,.2f}", na_rep="—"), width="stretch")
 
 # ---------- FCF ----------
 with tab_fcf:
-    if view["fcf"].notna().any():
-        div, unit = (1e9, "B") if view["fcf"].abs().max() >= 1e9 else (1e6, "M")
-        y = view["fcf"] / div
-        fig = go.Figure(go.Bar(
-            x=view["label"], y=y, name="Free Cash Flow",
-            marker_color=[BLUE if v >= 0 else RED for v in y.fillna(0)],
-            texttemplate=f"{csym}%{{y:,.2f}}{unit}", textposition="outside",
-            customdata=view["fcf"], hovertemplate=f"%{{x}}<br>FCF: {csym}%{{customdata:,.0f}}<extra></extra>"))
-        st.plotly_chart(style(fig, ticksuffix=unit, tickprefix=csym, tickformat=",.0f"), width="stretch")
-        if cur_note:
-            st.caption(cur_note)
-    else:
-        st.info("Sin datos de FCF para este ticker.")
+    fin_controls("fcf")
+    if has_data():
+        if view["fcf"].notna().any():
+            div, unit = (1e9, "B") if view["fcf"].abs().max() >= 1e9 else (1e6, "M")
+            y = view["fcf"] / div
+            fig = go.Figure(go.Bar(
+                x=view["label"], y=y, name="Free Cash Flow",
+                marker_color=[BLUE if v >= 0 else RED for v in y.fillna(0)],
+                texttemplate=f"{csym}%{{y:,.2f}}{unit}", textposition="outside",
+                customdata=view["fcf"], hovertemplate=f"%{{x}}<br>FCF: {csym}%{{customdata:,.0f}}<extra></extra>"))
+            st.plotly_chart(style(fig, ticksuffix=unit, tickprefix=csym, tickformat=",.0f"), width="stretch")
+            glosario("FCF")
+            if cur_note:
+                st.caption(cur_note)
+        else:
+            st.info("Sin datos de FCF para este ticker.")
 
-with st.expander("Ver datos"):
-    fcf_col = f"FCF ({cur})" if cur else "FCF"
-    t = view.drop(columns="date").set_index("label").rename_axis("Periodo").rename(columns={
-        "eps": "EPS", "fcf": fcf_col, "gross": "Margen bruto (%)",
-        "operating": "Margen operativo (%)", "profit": "Margen de beneficio (%)", "roce": "ROCE (%)"})
-    fmt = {c: "{:,.2f}" for c in t.columns}
-    fmt[fcf_col] = "{:,.0f}"
-    st.dataframe(t.style.format(fmt, na_rep="—"), width="stretch")
+# ---------- PEG ratio ----------
+with tab_peg:
+    fin_controls("peg", mode=False, cmp=True)
+    if has_data():
+        cmp_sym = st.session_state["cmp"] if st.session_state["cmp"] != symbol else ""
+        ad = annual(symbol)
+        if ad is None or ad["eps"].dropna().empty:
+            st.info("Sin EPS anual para calcular el PEG de este ticker.")
+        elif not same_currency(meta):
+            st.info(f"No se calcula el PEG: el precio está en {meta.get('currency')} y las cifras en {cur}.")
+        else:
+            pg = pe_peg(symbol, ad)
+            pg = pg.tail(years) if years else pg
+            last = pg.dropna(subset=["peg"]).tail(1)
+            m = st.columns(4)
+            m[0].metric("P/E (TTM)", _n(meta.get("trailingPE")), help=TIPS["P/E"])
+            m[1].metric("Crecimiento EPS (CAGR)", f"{last['growth'].iloc[0]:.1f}%" if len(last) else "N/D", help=TIPS["Crecimiento EPS (CAGR)"])
+            m[2].metric("PEG calculado", _n(last["peg"].iloc[0]) if len(last) else "N/D", help=TIPS["PEG"])
+            m[3].metric("PEG (Yahoo)", _n(meta.get("trailingPegRatio") or meta.get("pegRatio")),
+                        help="PEG que publica Yahoo; usa otra estimación de crecimiento, por eso puede diferir del calculado.")
+            cg = None
+            if cmp_sym:
+                cad = annual(cmp_sym)
+                if cad is not None and same_currency(info(cmp_sym)):
+                    cg = pe_peg(cmp_sym, cad)
+                    cg = cg.tail(years) if years else cg
+                else:
+                    st.warning(f"No se pudo calcular el PEG de {cmp_sym}.")
+            if pg["peg"].notna().any() or (cg is not None and cg["peg"].notna().any()):
+                fig = go.Figure()
+                if cg is None:  # verde < 1, azul 1-2, rojo > 2
+                    cols = [("#9aa0a6" if pd.isna(v) else GREEN if v < 1 else BLUE if v <= 2 else RED) for v in pg["peg"]]
+                    fig.add_bar(x=pg["label"], y=pg["peg"], name="PEG", marker_color=cols, texttemplate="%{y:.2f}", textposition="outside")
+                else:
+                    fig.add_bar(x=pg["label"], y=pg["peg"], name=f"PEG {symbol}", marker_color=BLUE, texttemplate="%{y:.2f}", textposition="outside")
+                    fig.add_bar(x=cg["label"], y=cg["peg"], name=f"PEG {cmp_sym}", marker_color=ORANGE, texttemplate="%{y:.2f}", textposition="outside")
+                fig.add_hline(y=1, line_dash="dash", line_color="rgba(200,200,200,.8)", annotation_text="PEG = 1", annotation_position="top left")
+                st.plotly_chart(style(fig, title_text="PEG (veces)"), width="stretch")
+                glosario("PEG", "P/E", "Crecimiento EPS (CAGR)")
+                st.caption("PEG = P/E ÷ crecimiento anual del EPS (%). El P/E usa el precio al cierre de cada ejercicio fiscal y el "
+                           "crecimiento es el CAGR del EPS de hasta 3 años. Verde: menor a 1. Azul: entre 1 y 2. Rojo: mayor a 2. "
+                           "Solo se calcula si el crecimiento es positivo. Es una guía de valoración, no una recomendación.")
+            else:
+                st.info("No hay suficientes años con EPS positivo y creciente para calcular el PEG (necesita crecimiento mayor a 0).")
+            with st.expander("Ver datos del PEG"):
+                t = pg.set_index("label").rename_axis("Periodo").rename(columns={
+                    "eps": "EPS", "pe": "P/E", "growth": "Crecimiento EPS (%)", "peg": "PEG"})
+                st.dataframe(t.style.format("{:,.2f}", na_rep="—"), width="stretch")
